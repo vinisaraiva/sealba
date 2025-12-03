@@ -61,7 +61,7 @@ def load_series():
 @st.cache_data
 def load_clima():
     """Dados anuais por município (clima + NPP)."""
-    #xlsx_path = DATA_DIR / "Dataset_clima_SeAlBa.xlsx"
+    xlsx_path = DATA_DIR / "Dataset_clima_SeAlBa.xlsx"
     parquet_path = DATA_DIR / "Dataset_clima_SeAlBa.parquet"
     if parquet_path.exists():
         df = pd.read_parquet(parquet_path)
@@ -84,7 +84,7 @@ def load_clima():
 @st.cache_data
 def load_uso_media():
     """Médias de uso do solo por município (agro, pasto, floresta)."""
-    #xlsx_path = DATA_DIR / "media_agro_past_floresta.xlsx"
+    xlsx_path = DATA_DIR / "media_agro_past_floresta.xlsx"
     parquet_path = DATA_DIR / "media_agro_past_floresta.parquet"
     if parquet_path.exists():
         df = pd.read_parquet(parquet_path)
@@ -214,10 +214,10 @@ if page.startswith("0"):
     with col2:
         mapa_path = DATA_DIR / "mapa_sealba.jpg"
         if mapa_path.exists():
-            st.image(mapa_path, caption="Região SEALBA (Sergipe, Alagoas e Bahia)")
+            st.image(str(mapa_path), caption="Região SEALBA (Sergipe, Alagoas e Bahia)")
         else:
             st.info(
-                "Insira um arquivo de mapa chamado **`mapa_sealba.png`** na mesma pasta "
+                "Insira um arquivo de mapa chamado **`mapa_sealba.jpg`** na mesma pasta "
                 "para exibir aqui a localização da região SEALBA."
             )
 
