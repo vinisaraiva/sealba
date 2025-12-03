@@ -1,6 +1,5 @@
 [server]
+address = "0.0.0.0"
 headless = true
 enableCORS = false
-enableXsrfProtection = true
-port = $PORT
-address = "0.0.0.0"
+enableXsrfProtection = false
