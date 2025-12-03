@@ -1,481 +1,796 @@
-# SEALBA Panel – Streamlit (evento científico, sem upload) – v2.3
-# Foco: clareza científica, legendas/ajuda, correlação com resumo e nível de análise
-# ----------------------------------------------------
-# Uso:
-#   streamlit run SEALBA_panel_app.py
+# SEALBA – Painel de Sequestro de Carbono e Expansão Agropecuária
+# Versão 2.0 (dados 2001–2023)
+# ----------------------------------------------------------
 # Requisitos:
-#   pip install -r requirements_sealba_panel.txt
-# ----------------------------------------------------
+#   pip install streamlit pandas plotly scikit-learn statsmodels
+# Execução:
+#   streamlit run sealba_painel.py
+# ----------------------------------------------------------
 
 from pathlib import Path
-import importlib.util
 
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 import plotly.express as px
 import streamlit as st
-
-
-# =======================
-# Config & constantes
-# =======================
-st.set_page_config(page_title="SEALBA – Painel Socioambiental", layout="wide")
-DATASET_PATH = Path(__file__).parent / "sealba_dataset.xlsx"
-# IMPORTANTE: o arquivo acima deve conter a planilha "master_municipio_ano"
-# com colunas (exemplos): ano, uf, municipio, pib_total_mil_reais, pib_percapita_reais,
-# vab_agropecuaria_mil, precip_media_mm (ou pr_mean), idh_total, tmean, ur_mean, evt_mean etc.
-
-AUTHORS = ["Dian Júnio B. Borges", "Talia S. Ribeiro", "Breno A. S. Santos", "Tatiane N. S. Sena", "Vinicius S. Santos"]
-SEALBA_UFS = {"AL", "BA", "SE"}    # apenas estados participantes da SEALBA
-CORR_STRONG_THR = 0.5              # |r| destacado no heatmap de correlação
-
-# Detectar statsmodels (necessário para trendlines OLS/LOWESS no plotly express)
-has_statsmodels = importlib.util.find_spec("statsmodels") is not None
-
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 # =======================
-# Funções auxiliares
+# Configuração geral
 # =======================
-@st.cache_data(show_spinner=False)
-def load_master(path: Path) -> pd.DataFrame:
-    """
-    Lê o arquivo mestre e tenta garantir tipos adequados de colunas.
-    Espera encontrar a sheet "master_municipio_ano".
-    """
-    df = pd.read_excel(path, sheet_name="master_municipio_ano")
-    df.columns = [c.strip() for c in df.columns]
-    # ano como inteiro (nullable)
-    if "ano" in df.columns:
-        df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
+st.set_page_config(
+    page_title="SEALBA – Sequestro de Carbono e Expansão Agropecuária",
+    layout="wide",
+)
 
-    # converter numérico quando possível (exceto chaves categóricas)
-    for c in df.columns:
-        if df[c].dtype == object and c not in ["uf", "municipio"]:
-            df[c] = pd.to_numeric(df[c], errors="ignore")
+DATA_DIR = Path(__file__).parent
+
+# Paletas de cores padronizadas
+COLOR_CLASSES = {
+    "Floresta": "#1b7837",
+    "Agricultura": "#fdae61",
+    "Vegetação Herbácea e Arbustiva": "#d9f0d3",
+    "Pastagem": "#d9ef8b",
+    "Área Não Vegetada": "#999999",
+    "Corpo D'água": "#3288bd",
+}
+
+COLOR_CLIMA = {
+    "Precipitação (mm)": "#2166ac",
+    "ETo (mm)": "#67a9cf",
+    "Temperatura média (°C)": "#ef8a62",
+    "Umidade relativa (%)": "#fddbc7",
+}
+
+# =======================
+# Funções utilitárias
+# =======================
+
+@st.cache_data
+def load_series():
+    """Séries anuais agregadas da região SEALBA."""
+    df = pd.read_excel(DATA_DIR / "series_anuais.xlsx")
+    df["Ano"] = pd.to_numeric(df["Ano"], errors="coerce")
+    df.loc[~np.isfinite(df["Ano"]), "Ano"] = np.nan
+    df["Ano"] = df["Ano"].astype("Int64")
     return df
 
 
-def numeric_columns(df: pd.DataFrame) -> list:
-    """Lista de colunas numéricas (exclui 'ano' para evitar eixos com período sendo tratado como métrica)."""
-    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c != "ano"]
-
-
-def fmt_number(val):
-    """Formatação amigável de números em métricas."""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return "—"
-    if isinstance(val, (int, np.integer)):
-        return f"{val:,}".replace(",", ".")
-    try:
-        return f"{val:,.0f}".replace(",", ".")
-    except Exception:
-        return str(val)
-
-
-def analysis_level_label(df_filtered: pd.DataFrame) -> str:
-    """
-    Retorna um texto dizendo o nível da análise baseado nas UFs presentes no recorte filtrado.
-    """
-    if "uf" in df_filtered.columns:
-        ufs = df_filtered["uf"].dropna().unique().tolist()
+@st.cache_data
+def load_clima():
+    """Dados anuais por município (clima + NPP)."""
+    xlsx_path = DATA_DIR / "Dataset_clima_SeAlBa.xlsx"
+    parquet_path = DATA_DIR / "Dataset_clima_SeAlBa.parquet"
+    if parquet_path.exists():
+        df = pd.read_parquet(parquet_path)
     else:
-        ufs = []
-    if len(ufs) == 0:
-        return "Nível: regional (SEALBA)"
-    elif set(ufs).issubset(SEALBA_UFS) and len(ufs) == len(SEALBA_UFS):
-        return "Nível: regional (SEALBA – AL, BA e SE)"
-    elif len(ufs) == 1:
-        return f"Nível: intraestadual ({ufs[0]})"
+        df = pd.read_excel(xlsx_path)
+        # Persistir versão otimizada para futuras execuções
+        try:
+            df.to_parquet(parquet_path, compression="zstd", index=False)
+        except Exception:
+            pass
+    # Padronizar nomes e tipos
+    df.rename(columns={"municipio": "Municipio"}, inplace=True)
+    if "ano" in df.columns:
+        df["ano"] = pd.to_numeric(df["ano"], errors="coerce")
+        df.loc[~np.isfinite(df["ano"]), "ano"] = np.nan
+        df["ano"] = df["ano"].astype("Int64")
+    return df
+
+
+@st.cache_data
+def load_uso_media():
+    """Médias de uso do solo por município (agro, pasto, floresta)."""
+    xlsx_path = DATA_DIR / "media_agro_past_floresta.xlsx"
+    parquet_path = DATA_DIR / "media_agro_past_floresta.parquet"
+    if parquet_path.exists():
+        df = pd.read_parquet(parquet_path)
     else:
-        return "Nível: multiestados (AL/BA/SE)"
+        df = pd.read_excel(xlsx_path)
+        df["Municipio"] = df["Municipio"].astype(str)
+        try:
+            df.to_parquet(parquet_path, compression="zstd", index=False)
+        except Exception:
+            pass
+    return df
 
 
-def corr_summary_tables(df_sub: pd.DataFrame, method: str = "spearman"):
-    """
-    Calcula a matriz de correlação e retorna:
-    - corr: DataFrame de correlação
-    - cm_sorted: pares ordenados por |r| desc
-    - top_pos: top 10 r positivos
-    - top_neg: top 10 r negativos
-    """
-    if df_sub.empty or df_sub.shape[1] < 2:
-        return None, None, None, None
-
-    corr = df_sub.corr(method=method)
-    # Transformar em pares (var1, var2, r), removendo diagonal e duplicatas
-    melted = (
-        corr.reset_index()
-        .melt(id_vars="index", var_name="var2", value_name="r")
-        .rename(columns={"index": "var1"})
+def small_card(label, value, suffix=""):
+    st.markdown(
+        f"""
+        <div style="padding:0.4rem 0.8rem;border-radius:0.6rem;
+                    background-color:#f7f7f9;border:1px solid #e0e0e0;
+                    display:inline-block;margin-right:0.6rem;margin-bottom:0.4rem;">
+            <span style="font-size:0.75rem;color:#888;">{label}</span><br>
+            <span style="font-size:1.1rem;font-weight:600;color:#333;">
+                {value}{suffix}
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    melted = melted[melted["var1"] < melted["var2"]]
-    melted["abs_r"] = melted["r"].abs()
 
-    cm_sorted = melted.sort_values("abs_r", ascending=False)
-    top_pos = melted.sort_values("r", ascending=False).head(10)
-    top_neg = melted.sort_values("r", ascending=True).head(10)
-    return corr, cm_sorted, top_pos, top_neg
+
+def corr_info(x, y, method="pearson"):
+    """Retorna coeficiente de correlação e n (tratando NaN)."""
+    s1 = x.astype(float)
+    s2 = y.astype(float)
+    mask = s1.notna() & s2.notna()
+    if mask.sum() < 3:
+        return np.nan, mask.sum()
+    coef = s1[mask].corr(s2[mask], method=method)
+    return coef, mask.sum()
+
+
+def regressao_linear(x, y):
+    """Ajusta regressão linear e retorna slope, intercept e R²."""
+    mask = x.notna() & y.notna()
+    if mask.sum() < 3:
+        return np.nan, np.nan, np.nan
+    X = sm.add_constant(x[mask].astype(float))
+    model = sm.OLS(y[mask].astype(float), X).fit()
+    intercept = model.params["const"]
+    slope = model.params[x.name]
+    r2 = model.rsquared
+    return slope, intercept, r2
 
 
 # =======================
 # Carregar dados
 # =======================
-if not DATASET_PATH.exists():
-    st.error(
-        "Dataset padrão não encontrado ao lado do app: **SEALBA_dataset_master.xlsx**.\n\n"
-        "Coloque o arquivo na mesma pasta do `SEALBA_panel_app.py` e garanta que exista a aba "
-        "`master_municipio_ano` com as colunas necessárias."
-    )
-    st.stop()
 
-df = load_master(DATASET_PATH)
+series = load_series()
+clima = load_clima()
+uso_media = load_uso_media()
 
-# Restringe apenas a SEALBA
-if "uf" in df.columns:
-    df = df[df["uf"].isin(SEALBA_UFS)].copy()
+# =======================
+# Sidebar – navegação + autoria
+# =======================
 
-# Título
-st.title("SEALBA – Painel Socioambiental")
-st.caption(
-    "Protótipo interativo para análise de dados socioambientais e econômicos (2014–2023). "
-    "Estados: AL, BA e SE. Sem upload — dados do artigo embutidos."
+#st.sidebar.title("SEALBA – Painel Interativo")
+st.sidebar.markdown(
+    "Explore a dinâmica de **uso da terra, clima e sequestro de carbono** "
+    "na região do SeAlBa (Sergipe, Alagoas e Bahia)."
+)
+
+page = st.sidebar.radio(
+    "Selecione a seção:",
+    [
+        "0. Início",
+        "1. Uso e Cobertura da Terra",
+        "2. Clima",
+        "3. NPP e Sequestro de Carbono",
+        "4. Análises Estatísticas",
+    ],
+)
+
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "Dados: MapBiomas, MODIS/MOD17A3, BR-DWGD. "
+    "Período principal: 2001–2023."
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown(
+    "#### Autoria\n"
+    "Vinícius Saraiva Santos  \n"
+    "Talia Silva Ribeiro  \n"
+    "Breno Arles da Silva Santos  \n"
+    "Dian Júnio Bomfim Borges  \n"
+    "Tatiane Neres dos Santos Sena  \n"
+    "\n"
+    "*Doutorandos do PPG Biossistemas – UFSB*"
 )
 
 # =======================
-# Sidebar – Filtros
+# Página 0 – Início
 # =======================
-st.sidebar.header("Filtros")
-ufs_disponiveis = (
-    sorted([u for u in df["uf"].dropna().unique().tolist() if u in SEALBA_UFS])
-    if "uf" in df.columns
-    else []
-)
-uf_sel = st.sidebar.multiselect("UF (apenas SEALBA)", options=ufs_disponiveis, default=ufs_disponiveis)
+if page.startswith("0"):
+    st.markdown("## SEALBA – Dinâmica Climática, Uso da Terra e Sequestro de Carbono")
 
-df1 = df[df["uf"].isin(uf_sel)] if uf_sel else df.copy()
+    col1, col2 = st.columns([1.5, 1])
 
-munis = sorted(df1["municipio"].dropna().unique().tolist()) if "municipio" in df1.columns else []
-muni_sel = st.sidebar.multiselect("Municípios (opcional)", options=munis, default=[])
-if muni_sel:
-    df1 = df1[df1["municipio"].isin(muni_sel)]
-
-if "ano" in df1.columns and df1["ano"].notna().any():
-    min_y = int(df1["ano"].min())
-    max_y = int(df1["ano"].max())
-    per = st.sidebar.slider("Período (ano)", min_value=min_y, max_value=max_y, value=(min_y, max_y))
-    df1 = df1[(df1["ano"] >= per[0]) & (df1["ano"] <= per[1])]
-
-# =======================
-# KPIs (topo) + status
-# =======================
-with st.status("Visão geral dos dados filtrados", state="complete"):
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        st.metric("Municípios", df1["municipio"].nunique())
-    with c2:
-        st.metric(
-            "Período",
-            f"{int(df1['ano'].min())}–{int(df1['ano'].max())}" if df1["ano"].notna().any() else "—",
+    with col1:
+        st.markdown(
+            "Este painel interativo reúne informações anuais sobre **clima**, "
+            "**uso e cobertura da terra** e **produtividade da vegetação** "
+            "(NPP) na região do SeAlBa – que abrange municípios de Sergipe, "
+            "Alagoas e Bahia.\n\n"
+            "Você pode navegar pelas abas para:\n"
+            "- acompanhar a expansão agropecuária e a perda de vegetação natural;\n"
+            "- visualizar anos de seca e de maior disponibilidade hídrica;\n"
+            "- investigar como essas mudanças afetam o sequestro de carbono;\n"
+            "- comparar municípios com perfis semelhantes."
         )
-    with c3:
-        val = df1["pib_total_mil_reais"].mean() if "pib_total_mil_reais" in df1.columns else None
-        st.metric("PIB total (média, R$ mil)", fmt_number(val))
-    with c4:
-        val = df1["pib_percapita_reais"].mean() if "pib_percapita_reais" in df1.columns else None
-        st.metric("PIB per capita (média, R$)", fmt_number(val))
-    with c5:
-        # caso a coluna específica de precip municipal não exista, tenta pr_mean como fallback
-        col_prec = "precip_media_mm" if "precip_media_mm" in df1.columns else ("pr_mean" if "pr_mean" in df1.columns else None)
-        val = df1[col_prec].mean() if col_prec else None
-        st.metric("Precipitação média municipal (mm)", fmt_number(val))
-    st.write(analysis_level_label(df1))
 
-st.markdown("---")
+        st.markdown("---")
+        st.markdown(
+            "👈 Use o menu lateral para escolher a seção que deseja explorar."
+        )
 
-# =======================
-# Abas
-# =======================
-tab_dash, tab_ts, tab_scatter, tab_corr, tab_rank, tab_autores = st.tabs(
-    ["📊 Painel", "📈 Série Temporal", "🔬 Dispersão / Tendência", "🔗 Correlação (heatmap)", "🏆 Rankings", "👥 Autores"]
-)
-
-# -----------------------
-# Aba: Painel (overview)
-# -----------------------
-with tab_dash:
-    st.subheader("Painel – visão geral")
-    st.caption("Cada ponto nos gráficos de dispersão representa **município×ano**; séries temporais podem ser médias regionais.")
-    a1, a2 = st.columns(2)
-
-    # Série temporal rápida (PIB total médio)
-    with a1:
-        if {"ano", "pib_total_mil_reais"}.issubset(df1.columns):
-            ser = df1.groupby("ano", as_index=False)["pib_total_mil_reais"].mean(numeric_only=True)
-            fig = px.line(ser, x="ano", y="pib_total_mil_reais", markers=True)
-            fig.update_layout(
-                height=320, margin=dict(l=10, r=10, t=30, b=10),
-                yaxis_title="PIB total (média, R$ mil)"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            with st.status("📌 Interpretação", state="complete"):
-                st.write("**Média SEALBA por ano**. Use os filtros de UF/municípios para mudar a composição desta média.")
+    with col2:
+        mapa_path = DATA_DIR / "mapa_sealba.jpg"
+        if mapa_path.exists():
+            st.image(mapa_path, caption="Região SEALBA (Sergipe, Alagoas e Bahia)")
         else:
-            st.info("Sem dados para série temporal de PIB total.")
-
-    # Dispersão rápida: VAB agro vs precip municipal
-    with a2:
-        if {"vab_agropecuaria_mil"}.issubset(df1.columns) and ("precip_media_mm" in df1.columns or "pr_mean" in df1.columns):
-            xcol = "precip_media_mm" if "precip_media_m m" in df1.columns else "pr_mean"
-            # corrigir typo se ocorrer
-            if "precip_media_m m" in df1.columns:
-                df1 = df1.rename(columns={"precip_media_m m": "precip_media_mm"})
-                xcol = "precip_media_mm"
-            xcol = "precip_media_mm" if "precip_media_mm" in df1.columns else "pr_mean"
-
-            d2 = df1[[xcol, "vab_agropecuaria_mil", "uf", "municipio", "ano"]].dropna()
-            trendline = None
-            if has_statsmodels:
-                trendline = "ols"  # pode alternar para "lowess"
-
-            fig2 = px.scatter(
-                d2, x=xcol, y="vab_agropecuaria_mil",
-                color="uf", hover_data=["municipio", "ano"], trendline=trendline
+            st.info(
+                "Insira um arquivo de mapa chamado **`mapa_sealba.png`** na mesma pasta "
+                "para exibir aqui a localização da região SEALBA."
             )
-            if not has_statsmodels:
-                fig2.update_layout(title="(Instale 'statsmodels' para exibir linha de tendência OLS/LOWESS)")
-
-            fig2.update_layout(
-                height=320, margin=dict(l=10, r=10, t=30, b=10),
-                xaxis_title=("Precipitação média municipal (mm)" if xcol == "precip_media_mm" else "Precipitação regional (mm)"),
-                yaxis_title="VAB Agro (R$ mil)"
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-            with st.status("📌 Leitura do gráfico", state="complete"):
-                st.write("**Cada ponto = município×ano**; cores distinguem **UFs**. A linha (se habilitada) resume a tendência OLS/LOWESS.")
-        else:
-            st.info("Sem dados suficientes para dispersão (VAB agro × precipitação).")
 
     st.markdown("---")
-    b1, b2 = st.columns(2)
+    st.caption(
+        "Este painel faz parte de um estudo sobre manejo e conservação na região semiárida "
+        "do SeAlBa, integrando dados satelitais de uso da terra, clima e sequestro de carbono."
+    )
 
-    # Série temporal regional de precip (pr_mean)
-    with b1:
-        if {"ano", "pr_mean"}.issubset(df1.columns):
-            serp = df1.groupby("ano", as_index=False)["pr_mean"].mean(numeric_only=True)
-            fig3 = px.line(serp, x="ano", y="pr_mean", markers=True)
-            fig3.update_layout(
-                height=280, margin=dict(l=10, r=10, t=30, b=10),
-                yaxis_title="Precipitação regional (mm)"
-            )
-            st.plotly_chart(fig3, use_container_width=True)
-            with st.status("📌 Nota metodológica", state="complete"):
-                st.write("**Média anual regional (SEALBA)** com base nos dados filtrados.")
-        else:
-            st.info("Sem dados para série de precipitação regional (pr_mean).")
 
-    # Boxplot por UF – PIB per capita (último ano do filtro)
-    with b2:
-        if {"uf", "ano", "pib_percapita_reais"}.issubset(df1.columns) and df1["ano"].notna().any():
-            last_y = int(df1["ano"].max())
-            bx = df1[df1["ano"] == last_y][["uf", "pib_percapita_reais"]].dropna()
-            if not bx.empty:
-                fig4 = px.box(bx, x="uf", y="pib_percapita_reais", points="suspectedoutliers")
-                fig4.update_layout(
-                    height=280, margin=dict(l=10, r=10, t=30, b=10),
-                    yaxis_title=f"PIB per capita (R$) — {last_y}"
-                )
-                st.plotly_chart(fig4, use_container_width=True)
-                with st.status("📌 Leitura do boxplot", state="complete"):
-                    st.write("**Comparação intra-SEALBA por UF** no último ano filtrado. Pontos fora do box podem indicar outliers.")
-            else:
-                st.info("Sem dados para boxplot de PIB per capita no ano selecionado.")
-        else:
-            st.info("Sem dados para boxplot de PIB per capita.")
+# =======================
+# Página 1 – Uso da Terra
+# =======================
+elif page.startswith("1"):
+    st.markdown("## Séries Temporais de Uso e Cobertura da Terra (2001–2023)")
 
-# -----------------------
-# Aba: Série temporal
-# -----------------------
-with tab_ts:
-    st.subheader("Série temporal agregada")
-    st.caption("Escolha **SEALBA (média)** para visão regional ou **Por UF** para série desagregada por estado.")
-    if "ano" not in df1.columns:
-        st.info("Sem coluna 'ano' para série temporal.")
-    else:
-        candidates = numeric_columns(df1)
-        prefer = ["pib_total_mil_reais", "pib_percapita_reais", "vab_agropecuaria_mil", "pr_mean", "precip_media_mm", "idh_total"]
-        defaults = [c for c in prefer if c in candidates] or (candidates[:1] if candidates else [])
-        var_ts = st.selectbox("Variável", options=candidates, index=(candidates.index(defaults[0]) if defaults else 0))
-        by = st.radio("Agregação", ["SEALBA (média)", "Por UF"], horizontal=True)
-        if by == "SEALBA (média)":
-            ser = df1.groupby("ano", as_index=False)[var_ts].mean(numeric_only=True)
-            fig = px.line(ser, x="ano", y=var_ts, markers=True)
-        else:
-            ser = df1.groupby(["ano", "uf"], as_index=False)[var_ts].mean(numeric_only=True)
-            fig = px.line(ser, x="ano", y=var_ts, color="uf", markers=True)
+    col1, col2 = st.columns([2, 1.2])
 
-        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), yaxis_title=var_ts)
+    with col1:
+        st.markdown(
+            "Este gráfico mostra como a área ocupada por cada classe de uso da terra "
+            "mudou ao longo dos anos na região do SeAlBa."
+        )
+
+        cols_area = [
+            "soma_Floresta_km2",
+            "soma_Agrop_km2",
+            "soma_VegHerbArb_km2",
+            "soma_Past_km2",
+            "soma_NaoVeg_km2",
+            "soma_Agua_km2",
+        ]
+        rename_map = {
+            "soma_Floresta_km2": "Floresta",
+            "soma_Agrop_km2": "Agricultura",
+            "soma_VegHerbArb_km2": "Vegetação Herbácea e Arbustiva",
+            "soma_Past_km2": "Pastagem",
+            "soma_NaoVeg_km2": "Área Não Vegetada",
+            "soma_Agua_km2": "Corpo D'água",
+        }
+
+        df_long = (
+            series[["Ano"] + cols_area]
+            .rename(columns=rename_map)
+            .melt(id_vars="Ano", var_name="Classe de Uso", value_name="Área (km²)")
+        )
+
+        fig = px.line(
+            df_long,
+            x="Ano",
+            y="Área (km²)",
+            color="Classe de Uso",
+            markers=True,
+            color_discrete_map=COLOR_CLASSES,
+        )
+        fig.update_layout(
+            margin=dict(l=10, r=10, t=30, b=10),
+            legend=dict(orientation="v", x=1.02, y=1),
+        )
         st.plotly_chart(fig, use_container_width=True)
-        with st.status("📌 Interpretação", state="complete"):
-            st.write(analysis_level_label(df1))
 
-# -----------------------
-# Aba: Dispersão / Tendência
-# -----------------------
-with tab_scatter:
-    st.subheader("Dispersão e linha de tendência")
-    st.caption("Selecione pares de variáveis. **Cada ponto = município×ano**. Cor pode ser UF, município ou ano.")
-    candidates = numeric_columns(df1)
-    if len(candidates) < 2:
-        st.info("Selecione um recorte com ao menos duas variáveis numéricas.")
+        st.caption(
+            "Linhas que sobem indicam expansão daquela classe; linhas que descem "
+            "indicam redução de área ao longo do tempo."
+        )
+
+    with col2:
+        st.markdown("#### Resumo recente (2021–2023)")
+        recent = series[series["Ano"] >= 2021]
+        for col, label in [
+            ("soma_Agrop_km2", "Agricultura"),
+            ("soma_Past_km2", "Pastagem"),
+            ("soma_Floresta_km2", "Floresta"),
+        ]:
+            media = recent[col].mean()
+            small_card(label, f"{media:,.0f}", " km²")
+
+        st.markdown("---")
+        st.markdown(
+            "💬 **Em termos simples:** a agricultura vem aumentando, a pastagem ainda "
+            "ocupa grande parte da área e a floresta mostra perda gradual de cobertura."
+        )
+
+    st.markdown("---")
+    st.markdown("### Tendências de classes selecionadas")
+
+    classe_sel = st.selectbox(
+        "Selecione uma classe para visualizar a tendência linear:",
+        ["Floresta", "Vegetação Herbácea e Arbustiva", "Agricultura", "Pastagem"],
+    )
+
+    if classe_sel == "Floresta":
+        col_name = "soma_Floresta_km2"
+        y_label = "Área Florestal (km²)"
+    elif classe_sel == "Vegetação Herbácea e Arbustiva":
+        col_name = "soma_VegHerbArb_km2"
+        y_label = "Área Herbácea e Arbustiva (km²)"
+    elif classe_sel == "Agricultura":
+        col_name = "soma_Agrop_km2"
+        y_label = "Área Agrícola (km²)"
     else:
-        # sugestões padrão
-        x_default = "precip_media_mm" if "precip_media_mm" in candidates else ( "pr_mean" if "pr_mean" in candidates else candidates[0] )
-        y_default = "vab_agropecuaria_mil" if "vab_agropecuaria_mil" in candidates else candidates[min(1, len(candidates)-1)]
+        col_name = "soma_Past_km2"
+        y_label = "Área de Pastagem (km²)"
 
-        xvar = st.selectbox("Eixo X", options=candidates, index=candidates.index(x_default))
-        yvar = st.selectbox("Eixo Y", options=candidates, index=candidates.index(y_default))
-        color_by = st.selectbox("Colorir por", options=[c for c in ["uf", "municipio", "ano"] if c in df1.columns], index=0)
+    fig_trend = px.scatter(
+        series,
+        x="Ano",
+        y=col_name,
+        trendline="ols",
+    )
+    fig_trend.update_traces(mode="markers", marker=dict(size=9, opacity=0.8))
+    fig_trend.update_layout(
+        yaxis_title=y_label,
+        margin=dict(l=10, r=10, t=30, b=10),
+    )
+    st.plotly_chart(fig_trend, use_container_width=True)
 
-        trend_opt = ["Sem linha"]
-        if has_statsmodels:
-            trend_opt += ["OLS (linear)", "LOWESS (suavizada)"]
-        model = st.radio("Tendência", trend_opt, horizontal=True, index=(1 if has_statsmodels else 0))
+    # Estatísticas da tendência
+    slope, intercept, r2 = regressao_linear(series["Ano"], series[col_name])
+    if not np.isnan(r2):
+        st.caption(
+            f"A linha reta resume a tendência ao longo do período. "
+            f"Coeficiente angular: **{slope:,.1f} km²/ano**; "
+            f"R² da regressão: **{r2:.2f}**."
+        )
+    else:
+        st.caption(
+            "Não foi possível calcular a regressão linear (dados insuficientes)."
+        )
 
-        trend = None
-        if model.startswith("OLS") and has_statsmodels:
-            trend = "ols"
-        elif model.startswith("LOWESS") and has_statsmodels:
-            trend = "lowess"
 
-        # Monta colunas únicas (narwhals/plotly requer nomes únicos)
-        cols = [xvar, yvar, color_by, "municipio", "uf", "ano"]
-        cols_unique = list(dict.fromkeys([c for c in cols if c in df1.columns]))
-        d = df1[cols_unique].dropna()
+# =======================
+# Página 2 – Clima
+# =======================
+elif page.startswith("2"):
+    st.markdown("## Dinâmica Climática na Região do SeAlBa")
 
-        if d.empty:
-            st.info("Sem dados suficientes para esse par de variáveis.")
-        else:
-            hover_base = [c for c in ["municipio", "uf", "ano"] if c in d.columns and c != color_by]
-            fig = px.scatter(
-                d, x=xvar, y=yvar,
-                color=(color_by if color_by in d.columns else None),
-                hover_data=hover_base,
-                trendline=trend
+    st.markdown(
+        "As curvas abaixo mostram como variáveis climáticas médias (chuva, "
+        "temperatura, evapotranspiração e umidade) se comportaram na região ao "
+        "longo dos anos."
+    )
+
+    clima_reg = series[["Ano", "media_pr", "media_eto", "media_tmean", "media_rh"]]
+
+    var_sel = st.multiselect(
+        "Selecione variáveis climáticas para plotar:",
+        ["Precipitação (mm)", "ETo (mm)", "Temperatura média (°C)", "Umidade relativa (%)"],
+        default=["Precipitação (mm)", "Temperatura média (°C)"],
+    )
+
+    normalizar = st.checkbox(
+        "Normalizar valores entre 0 e 1 (facilita a comparação entre variáveis)",
+        value=False,
+    )
+
+    rename = {
+        "media_pr": "Precipitação (mm)",
+        "media_eto": "ETo (mm)",
+        "media_tmean": "Temperatura média (°C)",
+        "media_rh": "Umidade relativa (%)",
+    }
+
+    cols = [k for k, v in rename.items() if v in var_sel]
+    df_plot = clima_reg[["Ano"] + cols].rename(columns=rename)
+
+    if normalizar and cols:
+        for col in df_plot.columns:
+            if col == "Ano":
+                continue
+            vmin = df_plot[col].min()
+            vmax = df_plot[col].max()
+            if vmax > vmin:
+                df_plot[col] = (df_plot[col] - vmin) / (vmax - vmin)
+        y_label = "Valor normalizado (0–1)"
+    else:
+        y_label = "Valor"
+
+    df_long = df_plot.melt(id_vars="Ano", var_name="Variável", value_name="Valor")
+
+    if not df_long.empty:
+        fig = px.line(
+            df_long,
+            x="Ano",
+            y="Valor",
+            color="Variável",
+            markers=True,
+            color_discrete_map=COLOR_CLIMA,
+        )
+        fig.update_layout(
+            margin=dict(l=10, r=10, t=30, b=10),
+            yaxis_title=y_label,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        if normalizar:
+            st.caption(
+                "Com a normalização, todas as variáveis variam entre 0 e 1. "
+                "Isso não altera os padrões ao longo do tempo, apenas coloca "
+                "tudo na mesma escala para facilitar a comparação visual."
             )
-            if (model != "Sem linha") and not has_statsmodels:
-                fig.update_layout(title="(Instale 'statsmodels' para habilitar linhas de tendência OLS/LOWESS)")
-            fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10), xaxis_title=xvar, yaxis_title=yvar)
-            st.plotly_chart(fig, use_container_width=True)
-            with st.status("📌 Dica de leitura", state="complete"):
-                st.write("Use a cor por **UF** para diferenças espaciais ou por **ano** para entender mudança temporal.")
-
-# -----------------------
-# Aba: Correlação (heatmap)
-# -----------------------
-with tab_corr:
-    st.subheader("Matriz de correlação")
-    st.caption("Escolha as variáveis. **Pearson** (linear) ou **Spearman** (monotônica). Destaque para |r| ≥ 0.5.")
-    candidates = numeric_columns(df1)
-    prefer = ["pib_total_mil_reais", "pib_percapita_reais", "vab_agropecuaria_mil", "precip_media_mm", "pr_mean", "tmean", "evt_mean", "ur_mean", "idh_total"]
-    default_vars = [c for c in prefer if c in candidates] or candidates[:6]
-    cols_sel = st.multiselect("Variáveis", candidates, default=default_vars)
-    method = st.radio("Método", ["spearman", "pearson"], index=0, horizontal=True)
-
-    if len(cols_sel) >= 2:
-        sub = df1[cols_sel].dropna()
-        n_obs = len(sub)
-        if not sub.empty:
-            corr = sub.corr(method=method)
-
-            # Heatmap com anotações (negrito quando |r| >= limiar)
-            import plotly.figure_factory as ff
-            z = corr.values
-            x = corr.columns.tolist()
-            y = corr.index.tolist()
-            ann = np.vectorize(lambda v: f"**{v:.2f}**" if abs(v) >= CORR_STRONG_THR else f"{v:.2f}")(z)
-
-            fig = ff.create_annotated_heatmap(
-                z=z, x=x, y=y, colorscale="RdBu", showscale=True, reversescale=True, zmin=-1, zmax=1,
-                annotation_text=ann
-            )
-            fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-
-            # Resumo lateral (top correlações)
-            _, cm_sorted, top_pos, top_neg = corr_summary_tables(sub, method=method)
-            cL, cR = st.columns(2)
-            with cL:
-                st.markdown("**Top correlações positivas (r)**")
-                if top_pos is not None and not top_pos.empty:
-                    st.dataframe(top_pos[["var1", "var2", "r"]].reset_index(drop=True))
-            with cR:
-                st.markdown("**Top correlações negativas (r)**")
-                if top_neg is not None and not top_neg.empty:
-                    st.dataframe(top_neg[["var1", "var2", "r"]].reset_index(drop=True))
-
-            with st.status("📌 Nota metodológica", state="complete"):
-                st.write(f"{analysis_level_label(df1)} · Método: **{method}** · Observações válidas: **n = {n_obs}** · Destaque: **|r| ≥ {CORR_STRONG_THR}**.")
         else:
-            st.info("Sem dados após remoção de NAs para as variáveis selecionadas.")
-    else:
-        st.info("Selecione ao menos duas variáveis para a correlação.")
+            st.caption(
+                "As variáveis estão em suas unidades originais. "
+                "Precipitação e ETo possuem valores numéricos muito maiores que "
+                "temperatura e umidade, por isso dominam o eixo vertical."
+            )
 
-# -----------------------
-# Aba: Rankings
-# -----------------------
-with tab_rank:
-    st.subheader("Rankings por ano (nível municipal)")
-    st.caption("Ordena **municípios** por variável selecionada, para o ano escolhido.")
-    candidates = numeric_columns(df1)
-    prefer = ["pib_percapita_reais", "pib_total_mil_reais", "vab_agropecuaria_mil", "precip_media_mm", "idh_total"]
-    defaults = [c for c in prefer if c in candidates] or (candidates[:1] if candidates else [])
+    st.markdown("---")
+    st.markdown(
+        "💬 **Resumo em linguagem simples:** este painel ajuda a enxergar os anos "
+        "de seca e de chuva mais abundante, que são o pano de fundo climático das "
+        "variações de produtividade da vegetação."
+    )
 
-    if not candidates:
-        st.info("Não há variáveis numéricas disponíveis para ranking.")
-    else:
-        var = st.selectbox("Variável para ranking", options=candidates, index=candidates.index(defaults[0]))
-        if "ano" in df1.columns and df1["ano"].notna().any():
-            years = sorted(df1["ano"].dropna().unique().tolist())
-            ysel = st.selectbox("Ano", options=years, index=len(years) - 1)
-            dd = df1[df1["ano"] == ysel][["municipio", "uf", var]].dropna().copy()
-            if dd.empty:
-                st.info("Sem dados para esse ano/variável.")
+
+# =======================
+# Página 3 – NPP e Sequestro de Carbono
+# =======================
+elif page.startswith("3"):
+    st.markdown("## Sequestro de Carbono – Produtividade Primária Líquida (2001–2023)")
+
+    col1, col2 = st.columns([2, 1.2])
+
+    with col1:
+        st.markdown(
+            "A curva abaixo representa a quantidade média de carbono fixada pela "
+            "vegetação da região em cada ano (NPP médio regional)."
+        )
+        fig_npp = px.line(
+            series,
+            x="Ano",
+            y="soma_mean_NPP",
+            markers=True,
+        )
+        fig_npp.update_traces(marker=dict(size=9))
+        fig_npp.update_layout(
+            yaxis_title="NPP médio regional (g C m⁻² ano⁻¹)",
+            margin=dict(l=10, r=10, t=30, b=10),
+        )
+        st.plotly_chart(fig_npp, use_container_width=True)
+
+        st.caption(
+            "Picos indicam anos em que a vegetação cresceu mais e fixou mais carbono; "
+            "vales indicam anos de menor crescimento, muitas vezes associados a secas."
+        )
+
+    with col2:
+        st.markdown("#### Destaques da série")
+        npp_min = series.loc[series["soma_mean_NPP"].idxmin()]
+        npp_max = series.loc[series["soma_mean_NPP"].idxmax()]
+
+        small_card("Ano de menor NPP", int(npp_min["Ano"]))
+        small_card("Ano de maior NPP", int(npp_max["Ano"]))
+        small_card(
+            "Amplitude",
+            f"{npp_max['soma_mean_NPP'] - npp_min['soma_mean_NPP']:.0f}",
+            " g C m⁻²",
+        )
+
+        st.markdown("---")
+        st.markdown(
+            "💬 **Em termos simples:** o NPP mostra o quanto a vegetação consegue "
+            "‘puxar’ carbono da atmosfera em cada ano, funcionando como um termômetro "
+            "da saúde da paisagem."
+        )
+
+    st.markdown("---")
+    st.markdown("### NPP por classe de uso da terra")
+
+    cols_npp = [
+        "soma_Floresta_NPP",
+        "soma_Agrop_NPP",
+        "soma_VegHerbArb_NPP",
+        "soma_Past_NPP",
+    ]
+    rename_npp = {
+        "soma_Floresta_NPP": "Floresta",
+        "soma_Agrop_NPP": "Agricultura",
+        "soma_VegHerbArb_NPP": "Vegetação Herbácea e Arbustiva",
+        "soma_Past_NPP": "Pastagem",
+    }
+
+    df_npp_long = (
+        series[["Ano"] + cols_npp]
+        .rename(columns=rename_npp)
+        .melt(id_vars="Ano", var_name="Classe de Uso", value_name="NPP total")
+    )
+
+    fig_classes = px.line(
+        df_npp_long,
+        x="Ano",
+        y="NPP total",
+        color="Classe de Uso",
+        markers=True,
+        color_discrete_map=COLOR_CLASSES,
+    )
+    fig_classes.update_traces(marker=dict(size=9))
+    fig_classes.update_layout(
+        yaxis_title="NPP total da classe (g C m⁻² ano⁻¹)",
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="v", x=1.02, y=1),
+    )
+    st.plotly_chart(fig_classes, use_container_width=True)
+
+    st.caption(
+        "Cada linha mostra quanto carbono é fixado por ano em cada tipo de uso da terra. "
+        "Diferenças entre elas revelam quais classes contribuem mais para o sequestro total."
+    )
+
+
+# =======================
+# Página 4 – Análises Estatísticas
+# =======================
+elif page.startswith("4"):
+    st.markdown("## Análises Estatísticas")
+
+    st.markdown(
+        "Nesta seção é possível investigar, de forma simples, como clima, uso da terra "
+        "e produtividade da vegetação se relacionam."
+    )
+
+    tab1, tab2, tab3 = st.tabs(
+        [
+            "4.1 – Correlações anuais (região)",
+            "4.2 – Médias municipais",
+            "4.3 – Clusterização de municípios",
+        ]
+    )
+
+    # 4.1 – Correlações anuais
+    with tab1:
+        st.markdown("### Correlação entre clima, uso da terra e NPP (2001–2023)")
+
+        st.markdown(
+            "Cada ponto do gráfico representa um ano. A inclinação da nuvem de pontos "
+            "indica se duas variáveis crescem ou diminuem juntas."
+        )
+
+        x_options = {
+            "Precipitação média (mm)": "media_pr",
+            "ETo média (mm)": "media_eto",
+            "Temperatura média (°C)": "media_tmean",
+            "Umidade relativa média (%)": "media_rh",
+            "Área agrícola (km²)": "soma_Agrop_km2",
+            "Área de pastagem (km²)": "soma_Past_km2",
+            "Área florestal (km²)": "soma_Floresta_km2",
+        }
+
+        y_options = {
+            "NPP médio regional": "soma_mean_NPP",
+            "NPP total – Agricultura": "soma_Agrop_NPP",
+            "NPP total – Pastagem": "soma_Past_NPP",
+            "NPP total – Floresta": "soma_Floresta_NPP",
+            "NPP total – Veg. Herbácea/Arbustiva": "soma_VegHerbArb_NPP",
+        }
+
+        col_sel1, col_sel2 = st.columns(2)
+        with col_sel1:
+            x_label = st.selectbox("Variável em X", list(x_options.keys()))
+        with col_sel2:
+            y_label = st.selectbox("Variável em Y", list(y_options.keys()))
+
+        metodo = st.radio(
+            "Método de correlação:",
+            ["Pearson (linear)", "Spearman (não paramétrico)"],
+            horizontal=True,
+        )
+        method_internal = "pearson" if "Pearson" in metodo else "spearman"
+
+        x_col = x_options[x_label]
+        y_col = y_options[y_label]
+
+        coef, n = corr_info(series[x_col], series[y_col], method=method_internal)
+
+        df_corr = series[["Ano", x_col, y_col]].dropna()
+
+        col_plot, col_stats = st.columns([2, 1])
+        with col_plot:
+            fig_scatter = px.scatter(
+                df_corr,
+                x=x_col,
+                y=y_col,
+                trendline="ols",
+                labels={x_col: x_label, y_col: y_label},
+            )
+            fig_scatter.update_traces(marker=dict(size=10, opacity=0.7))
+            fig_scatter.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig_scatter, use_container_width=True)
+
+            st.caption(
+                "Se os pontos formam uma nuvem inclinada para cima, valores altos em X "
+                "tendem a vir acompanhados de valores altos em Y. Inclinação para baixo "
+                "indica relação inversa."
+            )
+
+            csv_corr = df_corr.rename(
+                columns={x_col: x_label, y_col: y_label}
+            ).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Baixar dados desta correlação (CSV)",
+                data=csv_corr,
+                file_name="correlacao_anual_sealba.csv",
+                mime="text/csv",
+            )
+
+        with col_stats:
+            st.markdown("#### Estatísticas da correlação")
+            if np.isnan(coef):
+                st.write("Correlação não calculada (dados insuficientes).")
             else:
-                dd["municipio_uf"] = dd["municipio"] + " / " + dd["uf"]
-                topn = st.slider("Top N", min_value=5, max_value=30, value=10, step=1)
-                dd_top = dd.sort_values(var, ascending=False).head(topn)
-                dd_bot = dd.sort_values(var, ascending=True).head(topn)
+                small_card("n (anos)", n)
+                small_card(f"Coeficiente ({method_internal})", f"{coef:.2f}")
+                st.markdown("---")
+                if coef > 0.5:
+                    st.write("🔎 Correlação **positiva forte**.")
+                elif coef > 0.3:
+                    st.write("🔎 Correlação **positiva moderada**.")
+                elif coef < -0.5:
+                    st.write("🔎 Correlação **negativa forte**.")
+                elif coef < -0.3:
+                    st.write("🔎 Correlação **negativa moderada**.")
+                else:
+                    st.write("🔎 Correlação fraca ou inexistente.")
 
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown(f"**TOP {topn} — {var}**")
-                    if not dd_top.empty:
-                        figt = px.bar(dd_top[::-1], x=var, y="municipio_uf", orientation="h")
-                        figt.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="", xaxis_title=var)
-                        st.plotly_chart(figt, use_container_width=True)
-                with c2:
-                    st.markdown(f"**BOTTOM {topn} — {var}**")
-                    if not dd_bot.empty:
-                        figb = px.bar(dd_bot[::-1], x=var, y="municipio_uf", orientation="h")
-                        figb.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="", xaxis_title=var)
-                        st.plotly_chart(figb, use_container_width=True)
+            st.caption(
+                "Use esta aba para testar combinações como “área de agricultura × NPP” "
+                "ou “chuva × NPP por classe de uso”."
+            )
 
-                with st.status("📌 Interpretação", state="complete"):
-                    st.write("Ranking **municipal**. Use os filtros de UF/município para restringir o universo analisado.")
+    # 4.2 – Médias municipais
+    with tab2:
+        st.markdown("### Correlação entre agropecuária média e NPP médio por município")
+
+        st.markdown(
+            "Aqui cada ponto representa um município, usando a média dos anos analisados."
+        )
+
+        clima_mun = (
+            clima.groupby("Municipio", as_index=False)
+            .agg(
+                NPP_médio=("NPP", "mean"),
+                PR_média=("PR", "mean"),
+                Tmean_média=("Tmean", "mean"),
+                ETo_média=("ETo", "mean"),
+            )
+        )
+
+        mun_merged = clima_mun.merge(uso_media, on="Municipio", how="left")
+        mun_merged["media_agro_pasto"] = (
+            mun_merged["media_agro"].fillna(0) + mun_merged["media_past"].fillna(0)
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            x_choice = st.selectbox(
+                "Variável de uso da terra (X):",
+                [
+                    "Agricultura média (km²)",
+                    "Pastagem média (km²)",
+                    "Agropecuária média (km²)",
+                ],
+            )
+        with col_b:
+            y_choice = "NPP médio (g C m⁻² ano⁻¹)"
+
+        mapping_x = {
+            "Agricultura média (km²)": "media_agro",
+            "Pastagem média (km²)": "media_past",
+            "Agropecuária média (km²)": "media_agro_pasto",
+        }
+
+        x_var = mapping_x[x_choice]
+        y_var = "NPP_médio"
+
+        coef_mun, n_mun = corr_info(
+            mun_merged[x_var], mun_merged[y_var], method="spearman"
+        )
+
+        df_mun_plot = mun_merged[["Municipio", x_var, y_var]].dropna()
+
+        fig_mun = px.scatter(
+            df_mun_plot,
+            x=x_var,
+            y=y_var,
+            hover_name="Municipio",
+            labels={x_var: x_choice, y_var: y_choice},
+        )
+        fig_mun.update_traces(marker=dict(size=10, opacity=0.7))
+        fig_mun.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig_mun, use_container_width=True)
+
+        st.caption(
+            "Pontos mais à direita representam municípios com mais área agrícola ou de pasto; "
+            "pontos mais altos representam municípios com maior produtividade média da vegetação."
+        )
+
+        csv_mun = df_mun_plot.rename(
+            columns={x_var: x_choice, y_var: y_choice}
+        ).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Baixar dados desta análise municipal (CSV)",
+            data=csv_mun,
+            file_name="correlacao_municipios_sealba.csv",
+            mime="text/csv",
+        )
+
+        st.markdown("#### Estatísticas (Spearman)")
+        if not np.isnan(coef_mun):
+            small_card("n (municípios)", n_mun)
+            small_card("Coeficiente (Spearman)", f"{coef_mun:.2f}")
         else:
-            st.info("Sem coluna 'ano' para selecionar ranking anual.")
+            st.write("Correlação não calculada (dados insuficientes).")
 
-# -----------------------
-# Aba: Autores
-# -----------------------
-with tab_autores:
-    st.subheader("Autores do artigo")
-    st.markdown("A autoria desta pesquisa é composta por:")
-    for i, a in enumerate(AUTHORS, start=1):
-        st.markdown(f"- {i}. **{a}**")
+        st.markdown(
+            "💬 **Em linguagem simples:** esta análise mostra se municípios mais "
+            "agropecuários tendem a ter mais ou menos sequestro médio de carbono."
+        )
 
-st.markdown("---")
-st.caption(
-    "Fonte: IBGE (PIB Municipal), Embrapa/IBGE (municípios SEALBA), arquivos do projeto (uso/cobertura, clima). "
-    "Estados: AL, BA e SE. Destaques em correlação: |r| ≥ 0.5."
-)
+    # 4.3 – Clusterização
+    with tab3:
+        st.markdown("### Clusterização de municípios")
+
+        st.markdown(
+            "Nesta aba, municípios com comportamentos parecidos são agrupados em "
+            "clusters, considerando clima, uso da terra e produtividade."
+        )
+
+        vars_cluster = [
+            "NPP_médio",
+            "PR_média",
+            "Tmean_média",
+            "ETo_média",
+            "media_agro",
+            "media_past",
+            "media_floresta",
+        ]
+
+        df_cluster = mun_merged.dropna(subset=vars_cluster).copy()
+        X = df_cluster[vars_cluster].values
+
+        n_clusters = st.slider("Número de clusters (k):", 2, 6, 3)
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        df_cluster["cluster"] = kmeans.fit_predict(X_scaled).astype(int)
+
+        st.markdown("#### Distribuição dos municípios por cluster")
+        counts = df_cluster["cluster"].value_counts().sort_index()
+        for c, v in counts.items():
+            small_card(f"Cluster {c}", v, " municípios")
+
+        st.markdown("---")
+        st.markdown("#### Mapa conceitual: uso da terra × NPP médio")
+
+        fig_clu = px.scatter(
+            df_cluster,
+            x="media_agro",
+            y="NPP_médio",
+            color="cluster",
+            hover_name="Municipio",
+            labels={
+                "media_agro": "Agricultura média (km²)",
+                "NPP_médio": "NPP médio (g C m⁻² ano⁻¹)",
+            },
+        )
+        fig_clu.update_traces(marker=dict(size=10, opacity=0.8))
+        fig_clu.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig_clu, use_container_width=True)
+
+        st.caption(
+            "Cada cor representa um tipo de município. Isso ajuda a identificar, por exemplo, "
+            "grupos com muita agricultura e menor NPP, ou com mais floresta e maior NPP."
+        )
