@@ -191,7 +191,7 @@ st.sidebar.markdown(
 if page.startswith("0"):
     st.markdown("## SEALBA – Dinâmica Climática, Uso da Terra e Sequestro de Carbono")
 
-    col1, col2 = st.columns([1.5, 1])
+    col1, col2 = st.columns([1, 1])
 
     with col1:
         st.markdown(
